@@ -1,4 +1,5 @@
 <resources>
     <string name="app_name">TunerApp</string>
-    <string name="note">C#</string>
+    <string name="note">E2</string>
+    <string name="frequency">98.0</string>
 </resources>

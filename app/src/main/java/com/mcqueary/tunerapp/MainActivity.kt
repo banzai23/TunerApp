@@ -11,10 +11,10 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.MutableLiveData
-import androidx.lifecycle.Observer
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import com.mcqueary.tunerapp.databinding.ActivityMainBinding
+import kotlinx.coroutines.*
 import java.lang.String.format
 import java.util.*
 
@@ -25,7 +25,6 @@ private lateinit var viewModel: MainActivity.TunerViewModel
 
 class MainActivity : AppCompatActivity() {
 	private lateinit var binding: ActivityMainBinding
-	var recording = true
 
 	override fun onCreate(savedInstanceState: Bundle?) {
 		super.onCreate(savedInstanceState)
@@ -37,18 +36,112 @@ class MainActivity : AppCompatActivity() {
 		window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN) // hide keyboard
 
 		getMicPermission()
-		recordMic()
-		println("Passed recordMic!")
 
+		GlobalScope.launch(Dispatchers.Default) {
+			viewModel.recordMic()
+		}
+
+		viewModel.note.observe( this, {newNote ->
+			binding.tvNote.text = newNote
+		})
 		viewModel.frequency.observe(this, { newFreq ->
-			binding.tvNote.text = newFreq
+			binding.tvFreq.text = newFreq
+		})
+		viewModel.noteBar.observe(this, {newProgress ->
+			binding.noteBar.progress = newProgress
 		})
 	}
 	class TunerViewModel: ViewModel() {
+		val note = MutableLiveData<String>()
+		val noteBar = MutableLiveData<Int>()
 		val frequency = MutableLiveData<String>()
 
 		init {
+			note.value = "☺"
+			noteBar.value = 0
 			frequency.value = "0.0"
+		}
+
+		suspend fun recordMic() = withContext(Dispatchers.Default) {
+			android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
+			val notes = Notes()
+			val minBuffSize: Int = AudioRecord.getMinBufferSize(
+				SAMPLE_RATE,
+				AudioFormat.CHANNEL_IN_MONO,
+				AudioFormat.ENCODING_PCM_16BIT
+			)
+			val buffSize = minBuffSize * 4 // 22050 is 1 second
+			println(buffSize)
+			val audioBuffer = ShortArray(buffSize)
+			val recorder = AudioRecord(
+				MIC,
+				SAMPLE_RATE,
+				AudioFormat.CHANNEL_IN_MONO,
+				AudioFormat.ENCODING_PCM_16BIT,
+				buffSize
+			)
+			recorder.startRecording()
+			while (true) {
+				val sampleAmt = recorder.read(audioBuffer, 0, buffSize)
+				if (sampleAmt == buffSize) {
+					val freq = Frequency()
+					freq.rising = audioBuffer[1] > audioBuffer[0]
+					for (x in 1 until audioBuffer.size) {
+						if (audioBuffer[x] < -VOLUME_SENSITIVITY && !freq.rising) {
+							freq.rising = true
+							freq.valleyMark++
+						}
+						if (audioBuffer[x] > VOLUME_SENSITIVITY && freq.rising) {
+							freq.rising = false
+							freq.peakMark++
+						}
+					}
+					val freqFloat = freq.frequency(buffSize)
+
+					val value = format(Locale.ENGLISH, "%.1f", freqFloat)
+					if (freqFloat in 27.5..1567.9) {
+						lateinit var noteValue: String
+						var noteBarValue = 0
+						for (x in notes.freq.indices) {
+							if (freqFloat < notes.freq[x]) {
+								val freqHit = notes.freq[x] - freqFloat
+								val freqBack = freqFloat - notes.freq[x - 1]
+
+								if (freqBack < freqHit) {
+									noteValue = notes.name[x - 1]
+									if (freqBack != 0.0) // don't divide by Zero; higher on bar, hence add
+										noteBarValue =
+											50 + ((freqBack / freqHit) * 100).toInt()
+									else
+										noteBarValue = 50
+								} else {
+									noteValue = notes.name[x]
+									if (freqHit != 0.0) // don't divide by Zero; lower on bar, hence minus
+										noteBarValue =
+											50 - ((freqHit / freqBack) * 100).toInt()
+									else
+										noteBarValue = 50
+								}
+								break
+							}
+						}
+						launch(Dispatchers.Main) {
+							frequency.value = value
+							note.value = noteValue
+							noteBar.value = noteBarValue
+							println("Freq: $value\tNote: $noteValue")
+						}
+					} else {
+						if (frequency.value != "0.0") {
+							launch(Dispatchers.Main) {
+								frequency.value = "0.0"
+								note.value = "☺"
+								noteBar.value = 0
+							}
+						}
+					}
+				}
+			}
 		}
 	}
 	class Frequency {
@@ -62,93 +155,6 @@ class MainActivity : AppCompatActivity() {
 			val multiplyBy: Float = SAMPLE_RATE.toFloat() / buffSize.toFloat()
 			return valleyMark.toFloat() * multiplyBy
 		}
-	}
-	private fun recordMic() {
-		Thread {
-			android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
-			val notes = Notes()
-			val minBuffSize: Int = AudioRecord.getMinBufferSize(
-				SAMPLE_RATE,
-				AudioFormat.CHANNEL_IN_MONO,
-				AudioFormat.ENCODING_PCM_16BIT
-			)
-			val buffSize = 22050 // 22050 is 1 second
-			val audioBuffer = ShortArray(buffSize)
-			val recorder = AudioRecord(
-				MIC,
-				SAMPLE_RATE,
-				AudioFormat.CHANNEL_IN_MONO,
-				AudioFormat.ENCODING_PCM_16BIT,
-				buffSize
-			)
-			recorder.positionNotificationPeriod = buffSize / 2
-			recorder.setRecordPositionUpdateListener(object :
-				AudioRecord.OnRecordPositionUpdateListener {
-				override fun onPeriodicNotification(recorder: AudioRecord) {
-					val sampleAmt = recorder.read(audioBuffer, 0, buffSize)
-					if (sampleAmt == buffSize) {
-						val freq = Frequency()
-						freq.rising = audioBuffer[1] > audioBuffer[0]
-						for (x in 1 until audioBuffer.size) {
-							if (audioBuffer[x] < -VOLUME_SENSITIVITY && !freq.rising) {
-								freq.rising = true
-								freq.valleyMark++
-							}
-							if (audioBuffer[x] > VOLUME_SENSITIVITY && freq.rising) {
-								freq.rising = false
-								freq.peakMark++
-							}
-						}
-						val freqFloat = freq.frequency(buffSize)
-						val value = format(Locale.ENGLISH, "%.1f", freqFloat)
-						if (freqFloat in 27.5..1567.9) {
-							lateinit var noteValue: String
-
-							for (x in notes.freq.indices) {
-								if (freqFloat < notes.freq[x]) {
-									val freqHit= notes.freq[x] - freqFloat
-									val freqBack = freqFloat - notes.freq[x-1]
-
-									if (freqBack < freqHit) {
-										noteValue = notes.name[x - 1]
-										if (freqBack != 0.0) // don't divide by Zero; higher on bar, hence add
-											binding.noteBar.progress = 50 + ((freqBack / freqHit) * 100).toInt()
-										else
-											binding.noteBar.progress = 50
-									} else {
-										noteValue = notes.name[x]
-										if (freqHit != 0.0) // don't divide by Zero; lower on bar, hence minus
-											binding.noteBar.progress = 50 - ((freqHit / freqBack) * 100).toInt()
-										else
-											binding.noteBar.progress = 50
-									}
-
-
-									break
-								}
-							}
-
-							viewModel.frequency.value = noteValue
-							println("Freq: $value\tNote: $noteValue")
-						} else {
-							if (viewModel.frequency.value != "0.0") {
-								viewModel.frequency.value = "0.0"
-								binding.noteBar.progress = 0
-							}
-						}
-					}
-				}
-
-				override fun onMarkerReached(recorder: AudioRecord?) {
-					// do nothing
-				}
-			})
-			recorder.startRecording()
-			while (true) {
-				Thread.sleep(30)
-				recorder.read(audioBuffer, 0, buffSize)
-			}
-		}.start()
 	}
 	override fun onRequestPermissionsResult(
 		requestCode: Int,
