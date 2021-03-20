@@ -2,6 +2,7 @@ package com.mcqueary.tunerapp
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.graphics.Color
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder.AudioSource.MIC
@@ -19,7 +20,8 @@ import java.lang.String.format
 import java.util.*
 
 const val SAMPLE_RATE = 44100
-const val VOLUME_SENSITIVITY = 2000
+const val ONE_SECOND_IN_SAMPLES = SAMPLE_RATE / 2
+const val VOLUME_SENSITIVITY = 2000.toShort()
 
 private lateinit var viewModel: MainActivity.TunerViewModel
 
@@ -30,17 +32,12 @@ class MainActivity : AppCompatActivity() {
 		super.onCreate(savedInstanceState)
 		binding = ActivityMainBinding.inflate(layoutInflater)
 		setContentView(binding.root)
-
+		// bind the layout, then bind the viewModel
 		viewModel = ViewModelProvider(this).get(TunerViewModel::class.java)
 
-		window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN) // hide keyboard
 
-		getMicPermission()
-
-		GlobalScope.launch(Dispatchers.Default) {
-			viewModel.recordMic()
-		}
-
+		// TextView Note and Frequency, and ProgressBar NoteBar binding to liveData in viewModel
+		// in the following code
 		viewModel.note.observe( this, {newNote ->
 			binding.tvNote.text = newNote
 		})
@@ -50,10 +47,20 @@ class MainActivity : AppCompatActivity() {
 		viewModel.noteBar.observe(this, {newProgress ->
 			binding.noteBar.progress = newProgress
 		})
+		viewModel.noteBarColor.observe(this, {newColor ->
+			binding.tvNote.setBackgroundColor(newColor)
+		})
+		getMicPermission() // program exits if user doesn't allow Mic Permission
+		// if permission has already been previously granted, nothing shows up
+
+		GlobalScope.launch(Dispatchers.Default) {
+			viewModel.recordMic()   // launch audio recording of Mic on separate thread, not Main Thread
+		}
 	}
 	class TunerViewModel: ViewModel() {
 		val note = MutableLiveData<String>()
 		val noteBar = MutableLiveData<Int>()
+		val noteBarColor = MutableLiveData<Int>()
 		val frequency = MutableLiveData<String>()
 
 		init {
@@ -64,15 +71,15 @@ class MainActivity : AppCompatActivity() {
 
 		suspend fun recordMic() = withContext(Dispatchers.Default) {
 			android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
-			val notes = Notes()
-			val minBuffSize: Int = AudioRecord.getMinBufferSize(
-				SAMPLE_RATE,
-				AudioFormat.CHANNEL_IN_MONO,
-				AudioFormat.ENCODING_PCM_16BIT
+			val buffSize: Int = AudioRecord.getMinBufferSize(
+					SAMPLE_RATE,
+					AudioFormat.CHANNEL_IN_MONO,
+					AudioFormat.ENCODING_PCM_16BIT
 			)
-			val buffSize = minBuffSize * 4 // 22050 is 1 second
-			println(buffSize)
-			val audioBuffer = ShortArray(buffSize)
+			val readSamples = buffSize // half a second
+			val abSize = buffSize * 8   // 5 buffers worth of total stored in audioBuffer
+			val audioBuffer = ShortArray(abSize){0} // 1 second
+
 			val recorder = AudioRecord(
 				MIC,
 				SAMPLE_RATE,
@@ -81,26 +88,64 @@ class MainActivity : AppCompatActivity() {
 				buffSize
 			)
 			recorder.startRecording()
+
+			val notes = Notes()
+
 			while (true) {
 				val sampleAmt = recorder.read(audioBuffer, 0, buffSize)
-				if (sampleAmt == buffSize) {
-					val freq = Frequency()
+				if (sampleAmt == buffSize) { // recorder.read returns the number of samples read, this checks
+					val freq = Frequency()  // and continues if the buffSize is full
 					freq.rising = audioBuffer[1] > audioBuffer[0]
-					for (x in 1 until audioBuffer.size) {
+					for (x in 1 until readSamples) {
+						if (audioBuffer[x-1] == 0.toShort() &&
+								audioBuffer[x] == 0.toShort() && // if 3 samples in a row are zeros
+								audioBuffer[x+1] == 0.toShort()) {
+							continue
+						}
 						if (audioBuffer[x] < -VOLUME_SENSITIVITY && !freq.rising) {
 							freq.rising = true
-							freq.valleyMark++
 						}
+
 						if (audioBuffer[x] > VOLUME_SENSITIVITY && freq.rising) {
 							freq.rising = false
 							freq.peakMark++
+
+							if (!freq.sampleStart) {
+								freq.sampleStart = true
+								freq.sampleCount = 0    // reset sampleCount to start here
+							}
+						}
+
+						if (audioBuffer[x] > freq.peak)
+							freq.peak = audioBuffer[x]
+
+						freq.sampleCount++
+					}
+					// at the end of this calculation, rewind the frequency until we match where
+					// we started on the frequency, which is around VOLUME_SENSITIVITY
+					val lastWave = audioBuffer[readSamples - 1]
+					if (freq.rising || (!freq.rising && lastWave <= VOLUME_SENSITIVITY)) {
+						for (x in 1 until readSamples) {
+							if (audioBuffer[readSamples - x] > VOLUME_SENSITIVITY) {
+								freq.sampleCount -= x
+								break
+							}
+						}
+					} else if (!freq.rising && lastWave > VOLUME_SENSITIVITY) {
+						for (x in 1 until readSamples) {
+							if (audioBuffer[readSamples - x] < VOLUME_SENSITIVITY) {
+								freq.sampleCount -= x
+								break
+							}
 						}
 					}
-					val freqFloat = freq.frequency(buffSize)
+
+					val freqFloat = freq.frequency()
 
 					val value = format(Locale.ENGLISH, "%.1f", freqFloat)
 					if (freqFloat in 27.5..1567.9) {
 						lateinit var noteValue: String
+						var noteBarColorValue = R.color.orange
 						var noteBarValue = 0
 						for (x in notes.freq.indices) {
 							if (freqFloat < notes.freq[x]) {
@@ -109,18 +154,21 @@ class MainActivity : AppCompatActivity() {
 
 								if (freqBack < freqHit) {
 									noteValue = notes.name[x - 1]
-									if (freqBack != 0.0) // don't divide by Zero; higher on bar, hence add
+									if (freqHit != 0.0) // don't divide by Zero; higher on bar, hence add
 										noteBarValue =
-											50 + ((freqBack / freqHit) * 100).toInt()
+											50 + ((freqBack / freqHit) * 100.toDouble()).toInt()
 									else
 										noteBarValue = 50
 								} else {
 									noteValue = notes.name[x]
-									if (freqHit != 0.0) // don't divide by Zero; lower on bar, hence minus
+									if (freqBack != 0.0) // don't divide by Zero; lower on bar, hence minus
 										noteBarValue =
-											50 - ((freqHit / freqBack) * 100).toInt()
+											50 - ((freqHit / freqBack) * 100.toDouble()).toInt()
 									else
 										noteBarValue = 50
+
+									if (noteBarValue > 45 || noteBarValue < 55)
+										noteBarColorValue = R.color.green
 								}
 								break
 							}
@@ -129,6 +177,7 @@ class MainActivity : AppCompatActivity() {
 							frequency.value = value
 							note.value = noteValue
 							noteBar.value = noteBarValue
+							noteBarColor.value = noteBarColorValue
 							println("Freq: $value\tNote: $noteValue")
 						}
 					} else {
@@ -141,19 +190,10 @@ class MainActivity : AppCompatActivity() {
 						}
 					}
 				}
-			}
-		}
-	}
-	class Frequency {
-		//	var peak: Short = 0
-		//	var valley: Short = 0
-		var valleyMark = 0
-		var peakMark = 0
-		var rising: Boolean = false
 
-		fun frequency(buffSize: Int): Float {
-			val multiplyBy: Float = SAMPLE_RATE.toFloat() / buffSize.toFloat()
-			return valleyMark.toFloat() * multiplyBy
+				for (x in buffSize until audioBuffer.size)
+					audioBuffer[x] = audioBuffer[x-buffSize]
+			}
 		}
 	}
 	override fun onRequestPermissionsResult(
@@ -184,6 +224,18 @@ class MainActivity : AppCompatActivity() {
 				1234
 			)
 		}
+	}
+}
+class Frequency {
+	var peak: Short = VOLUME_SENSITIVITY
+	var peakMark = -1 // first iteration starts the chain frequency at Zero
+	var rising: Boolean = false
+	var sampleCount = 0
+	var sampleStart = false
+
+	fun frequency(): Double {
+		val multiplyBy: Double = SAMPLE_RATE.toDouble() / sampleCount.toDouble()
+		return peakMark.toDouble() * multiplyBy
 	}
 }
 class Notes {
